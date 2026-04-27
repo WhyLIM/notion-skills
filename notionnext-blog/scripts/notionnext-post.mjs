@@ -65,6 +65,88 @@ async function notionRequest(method, path, body = null, query = null) {
 /**
  * 将 Markdown 转换为 Notion blocks
  */
+
+/**
+ * 解析 Markdown 表格行为 Notion table blocks
+ * 支持标准 Markdown 表格语法：
+ *   | 列1 | 列2 | 列3 |
+ *   |-----|-----|-----|
+ *   | 内容 | 内容 | 内容 |
+ */
+function parseTable(lines, startIdx) {
+  const tableLines = [];
+  let i = startIdx;
+
+  // 收集所有表格行（直到遇到非表格行或空行）
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    // 跳过分隔行 |---|---|
+    if (line.match(/^\|[-:\s]+\|[-:\s]+\|/)) {
+      i++;
+      continue;
+    }
+    // 表格行必须以 | 开头
+    if (line.startsWith('|')) {
+      // 解析单元格
+      const cells = line.split('|').slice(1, -1).map(cell => {
+        const cellText = cell.trim();
+        // 对单元格内容应用内联格式化
+        const formatted = parseInlineFormatting(cellText);
+        if (formatted.length > 0 && formatted[0].paragraph) {
+          return formatted[0].paragraph.rich_text;
+        }
+        return [{ type: 'text', text: { content: cellText } }];
+      });
+      tableLines.push(cells);
+      i++;
+    } else {
+      break;
+    }
+  }
+
+  if (tableLines.length < 2) return { blocks: [], consumed: 0 };
+
+  const numCols = tableLines[0].length;
+  // 确保所有行都有相同的列数
+  const normalizedRows = tableLines.map(row => {
+    while (row.length < numCols) row.push([{ type: 'text', text: { content: '' } }]);
+    return row.slice(0, numCols);
+  });
+
+  // 第一行作为表头
+  const hasColumnHeader = true;
+  const blocks = [];
+
+  // 创建 table_row blocks 作为 table 的 children
+  const tableChildren = [];
+  for (let rowIdx = 0; rowIdx < normalizedRows.length; rowIdx++) {
+    const rowCells = normalizedRows[rowIdx];
+    // cells 格式: { "cell_0": [...rich_text], "cell_1": [...rich_text], ... }
+    const cells = rowCells;  // rowCells 本身就是数组的数组 [[rich_text], [rich_text], ...]
+    tableChildren.push({
+      object: 'block',
+      type: 'table_row',
+      table_row: {
+        cells,
+      }
+    });
+  }
+
+  // table_block 包含所有 row children（children 放在 table 属性内）
+  blocks.push({
+    object: 'block',
+    type: 'table',
+    table: {
+      table_width: numCols,
+      has_column_header: hasColumnHeader,
+      has_row_header: false,
+      children: tableChildren,
+    },
+  });
+
+  return { blocks, consumed: i - startIdx };
+}
+
 function mdToNotionBlocks(md) {
   if (!md || md.trim() === '') {
     return [];
@@ -80,6 +162,16 @@ function mdToNotionBlocks(md) {
     if (line.trim() === '') {
       i++;
       continue;
+    }
+
+    // 表格（必须在代码块之前检测，因为表格行可能包含特殊字符）
+    if (line.trim().startsWith('|') && i + 1 < lines.length) {
+      const result = parseTable(lines, i);
+      if (result.blocks.length > 0) {
+        blocks.push(...result.blocks);
+        i += result.consumed;
+        continue;
+      }
     }
 
     // 代码块
@@ -106,21 +198,27 @@ function mdToNotionBlocks(md) {
     // 标题 ###
     const h3Match = line.match(/^### (.+)$/);
     if (h3Match) {
-      blocks.push({ object: 'block', type: 'heading_3', heading_3: { rich_text: [{ type: 'text', text: { content: h3Match[1] } }] } });
+      const formatted = parseInlineFormatting(h3Match[1]);
+      const richText = formatted.length > 0 && formatted[0].paragraph ? formatted[0].paragraph.rich_text : [{ type: 'text', text: { content: h3Match[1] } }];
+      blocks.push({ object: 'block', type: 'heading_3', heading_3: { rich_text: richText } });
       i++; continue;
     }
 
     // 标题 ##
     const h2Match = line.match(/^## (.+)$/);
     if (h2Match) {
-      blocks.push({ object: 'block', type: 'heading_2', heading_2: { rich_text: [{ type: 'text', text: { content: h2Match[1] } }] } });
+      const formatted = parseInlineFormatting(h2Match[1]);
+      const richText = formatted.length > 0 && formatted[0].paragraph ? formatted[0].paragraph.rich_text : [{ type: 'text', text: { content: h2Match[1] } }];
+      blocks.push({ object: 'block', type: 'heading_2', heading_2: { rich_text: richText } });
       i++; continue;
     }
 
     // 标题 #
     const h1Match = line.match(/^# (.+)$/);
     if (h1Match) {
-      blocks.push({ object: 'block', type: 'heading_1', heading_1: { rich_text: [{ type: 'text', text: { content: h1Match[1] } }] } });
+      const formatted = parseInlineFormatting(h1Match[1]);
+      const richText = formatted.length > 0 && formatted[0].paragraph ? formatted[0].paragraph.rich_text : [{ type: 'text', text: { content: h1Match[1] } }];
+      blocks.push({ object: 'block', type: 'heading_1', heading_1: { rich_text: richText } });
       i++; continue;
     }
 
@@ -133,7 +231,12 @@ function mdToNotionBlocks(md) {
     // 引用
     const quoteMatch = line.match(/^> (.+)$/);
     if (quoteMatch) {
-      blocks.push({ object: 'block', type: 'quote', quote: { rich_text: [{ type: 'text', text: { content: quoteMatch[1] } }] } });
+      const formatted = parseInlineFormatting(quoteMatch[1]);
+      if (formatted.length > 0 && formatted[0].paragraph) {
+        blocks.push({ object: 'block', type: 'quote', quote: { rich_text: formatted[0].paragraph.rich_text } });
+      } else {
+        blocks.push({ object: 'block', type: 'quote', quote: { rich_text: [{ type: 'text', text: { content: quoteMatch[1] } }] } });
+      }
       i++; continue;
     }
 
@@ -143,7 +246,12 @@ function mdToNotionBlocks(md) {
       const listItems = [];
       while (i < lines.length && lines[i].match(/^- (.+)$/)) {
         const itemText = lines[i].match(/^- (.+)$/)[1];
-        listItems.push({ object: 'block', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ type: 'text', text: { content: itemText } }] } });
+        const formatted = parseInlineFormatting(itemText);
+        if (formatted.length > 0 && formatted[0].paragraph) {
+          listItems.push({ object: 'block', type: 'bulleted_list_item', bulleted_list_item: { rich_text: formatted[0].paragraph.rich_text } });
+        } else {
+          listItems.push({ object: 'block', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ type: 'text', text: { content: itemText } }] } });
+        }
         i++;
       }
       blocks.push(...listItems);
@@ -156,7 +264,12 @@ function mdToNotionBlocks(md) {
       const listItems = [];
       while (i < lines.length && lines[i].match(/^\d+\. (.+)$/)) {
         const itemText = lines[i].match(/^\d+\. (.+)$/)[1];
-        listItems.push({ object: 'block', type: 'numbered_list_item', numbered_list_item: { rich_text: [{ type: 'text', text: { content: itemText } }] } });
+        const formatted = parseInlineFormatting(itemText);
+        if (formatted.length > 0 && formatted[0].paragraph) {
+          listItems.push({ object: 'block', type: 'numbered_list_item', numbered_list_item: { rich_text: formatted[0].paragraph.rich_text } });
+        } else {
+          listItems.push({ object: 'block', type: 'numbered_list_item', numbered_list_item: { rich_text: [{ type: 'text', text: { content: itemText } }] } });
+        }
         i++;
       }
       blocks.push(...listItems);
@@ -177,70 +290,49 @@ function mdToNotionBlocks(md) {
 }
 
 /**
- * 解析单行内联格式
+ * 解析单行内联格式（改进版：使用 matchAll 精确定位，避免 split 边界问题）
  */
 function parseInlineFormatting(text) {
   if (!text.trim()) return [];
 
-  // inline code
-  if (text.match(/`[^`]+`/)) {
-    const parts = text.split(/(`[^`]+`)/);
-    const richTexts = parts.map(part => {
-      const match = part.match(/^`([^`]+)`$/);
-      if (match) return { type: 'text', text: { content: match[1] }, annotations: { code: true } };
-      return { type: 'text', text: { content: part } };
-    }).filter(p => p.text.content !== '');
-    if (richTexts.length > 0) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: richTexts } }];
-    return [];
-  }
+  // 通用的 rich_text 构造器
+  const buildRichTexts = (regex, getAnnotations) => {
+    const matches = [...text.matchAll(regex)];
+    if (matches.length === 0) return null;
+    const richTexts = [];
+    let lastIndex = 0;
+    for (const m of matches) {
+      if (m.index > lastIndex) {
+        richTexts.push({ type: 'text', text: { content: text.slice(lastIndex, m.index) } });
+      }
+      richTexts.push({ type: 'text', text: { content: m[1] }, annotations: getAnnotations(m[1]) });
+      lastIndex = m.index + m[0].length;
+    }
+    if (lastIndex < text.length) {
+      richTexts.push({ type: 'text', text: { content: text.slice(lastIndex) } });
+    }
+    return richTexts;
+  };
 
-  // strikethrough
-  if (text.match(/~~.*?~~/)) {
-    const parts = text.split(/(~~.*?~~)/);
-    const richTexts = parts.map(part => {
-      const match = part.match(/^~~(.+?)~~$/);
-      if (match) return { type: 'text', text: { content: match[1] }, annotations: { strikethrough: true } };
-      return { type: 'text', text: { content: part } };
-    }).filter(p => p.text.content !== '');
-    if (richTexts.length > 0) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: richTexts } }];
-    return [];
-  }
+  // inline code: `code`
+  let rich = buildRichTexts(/`([^`]+)`/g, () => ({ code: true }));
+  if (rich) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: rich } }];
 
-  // bold italic
-  if (text.match(/\*\*\*.+?\*\*\*/)) {
-    const parts = text.split(/(\*\*\*.+?\*\*\*)/);
-    const richTexts = parts.map(part => {
-      const match = part.match(/^\*\*\*(.+?)\*\*\*$/);
-      if (match) return { type: 'text', text: { content: match[1] }, annotations: { bold: true, italic: true } };
-      return { type: 'text', text: { content: part } };
-    }).filter(p => p.text.content !== '');
-    if (richTexts.length > 0) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: richTexts } }];
-    return [];
-  }
+  // strikethrough: ~~text~~
+  rich = buildRichTexts(/~~(.+?)~~/g, () => ({ strikethrough: true }));
+  if (rich) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: rich } }];
 
-  // bold
-  if (text.match(/\*\*.+?\*\*/)) {
-    const parts = text.split(/(\*\*.+?\*\*)/);
-    const richTexts = parts.map(part => {
-      const match = part.match(/^\*\*(.+?)\*\*$/);
-      if (match) return { type: 'text', text: { content: match[1] }, annotations: { bold: true } };
-      return { type: 'text', text: { content: part } };
-    }).filter(p => p.text.content !== '');
-    if (richTexts.length > 0) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: richTexts } }];
-    return [];
-  }
+  // bold italic: ***text***
+  rich = buildRichTexts(/\*\*\*(.+?)\*\*\*/g, () => ({ bold: true, italic: true }));
+  if (rich) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: rich } }];
 
-  // italic
-  if (text.match(/\*.+?\*/)) {
-    const parts = text.split(/(\*.+?\*)/);
-    const richTexts = parts.map(part => {
-      const match = part.match(/^\*(.+?)\*$/);
-      if (match) return { type: 'text', text: { content: match[1] }, annotations: { italic: true } };
-      return { type: 'text', text: { content: part } };
-    }).filter(p => p.text.content !== '');
-    if (richTexts.length > 0) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: richTexts } }];
-    return [];
-  }
+  // bold: **text**
+  rich = buildRichTexts(/\*\*(.+?)\*\*/g, () => ({ bold: true }));
+  if (rich) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: rich } }];
+
+  // italic: *text*
+  rich = buildRichTexts(/\*(.+?)\*/g, () => ({ italic: true }));
+  if (rich) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: rich } }];
 
   if (text.trim()) {
     return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content: text } }] } }];
