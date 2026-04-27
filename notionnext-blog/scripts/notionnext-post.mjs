@@ -147,6 +147,9 @@ function parseTable(lines, startIdx) {
   return { blocks, consumed: i - startIdx };
 }
 
+/**
+ * 解析 Markdown 为 Notion blocks（支持表格、图片、任务清单、嵌套列表、链接）
+ */
 function mdToNotionBlocks(md) {
   if (!md || md.trim() === '') {
     return [];
@@ -156,6 +159,118 @@ function mdToNotionBlocks(md) {
   const blocks = [];
   let i = 0;
 
+  // 检测缩进级别（每2个空格为一级）
+  function getIndent(line) {
+    const match = line.match(/^(\s*)/);
+    return Math.floor((match ? match[1].length : 0) / 2);
+  }
+
+  // 判断是否是列表项，返回 { type: 'ul'|'ol'|'todo', text, indent, checked }
+  function parseListMarker(line) {
+    const todoMatch = line.match(/^(\s*)-\s+\[([ xX])\]\s+(.+)$/);
+    if (todoMatch) return { type: 'todo', indent: getIndent(line), text: todoMatch[3], checked: todoMatch[2].toLowerCase() === 'x' };
+
+    const ulMatch = line.match(/^(\s*)- (.+)$/);
+    if (ulMatch) return { type: 'ul', indent: getIndent(line), text: ulMatch[2] };
+
+    const olMatch = line.match(/^(\s*)(\d+)\. (.+)$/);
+    if (olMatch) return { type: 'ol', indent: getIndent(line), text: olMatch[3], number: parseInt(olMatch[2]) };
+
+    return null;
+  }
+
+  // 解析单个列表项及其嵌套子项
+  function parseListGroup(lines, startIdx) {
+    const groupBlocks = [];
+    let i = startIdx;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      const marker = parseListMarker(line);
+
+      if (!marker) break;
+
+      const blockType = marker.type === 'todo' ? 'to_do' : (marker.type === 'ul' ? 'bulleted_list_item' : 'numbered_list_item');
+      const baseIndent = marker.indent;
+
+      // 解析内联格式（包括链接）
+      const formatted = parseInlineFormatting(marker.text);
+      const richText = formatted.length > 0 && formatted[0].paragraph ? formatted[0].paragraph.rich_text : [{ type: 'text', text: { content: marker.text } }];
+
+      // 提取链接用于 to_do checked
+      let checked = false;
+      if (marker.type === 'todo') {
+        checked = marker.checked;
+      }
+
+      const block = { object: 'block', type: blockType };
+      if (blockType === 'to_do') {
+        block.to_do = { rich_text: richText, checked };
+      } else if (blockType === 'bulleted_list_item') {
+        block.bulleted_list_item = { rich_text: richText };
+      } else {
+        block.numbered_list_item = { rich_text: richText };
+      }
+
+      // 收集直接子项（缩进更大的连续列表项）
+      const children = [];
+      i++;
+      while (i < lines.length) {
+        const childLine = lines[i];
+        const childMarker = parseListMarker(childLine);
+        if (!childMarker) { i++; continue; }
+        if (childMarker.indent <= baseIndent) break;
+
+        // 子项的缩进必须比父项多至少1级
+        if (childMarker.indent > baseIndent) {
+          // 收集所有缩进 >= childIndent 的连续子行
+          const childIndent = childMarker.indent;
+          const subChildren = [];
+          while (i < lines.length) {
+            const subLine = lines[i];
+            const subMarker = parseListMarker(subLine);
+            if (!subMarker || subMarker.indent < childIndent) break;
+            if (subMarker.indent === childIndent) {
+              const subFormatted = parseInlineFormatting(subMarker.text);
+              const subRichText = subFormatted.length > 0 && subFormatted[0].paragraph ? subFormatted[0].paragraph.rich_text : [{ type: 'text', text: { content: subMarker.text } }];
+              const subBlockType = subMarker.type === 'todo' ? 'to_do' : (subMarker.type === 'ul' ? 'bulleted_list_item' : 'numbered_list_item');
+              const subBlock = { object: 'block', type: subBlockType };
+              if (subBlockType === 'to_do') {
+                subBlock.to_do = { rich_text: subRichText, checked: subMarker.checked };
+              } else if (subBlockType === 'bulleted_list_item') {
+                subBlock.bulleted_list_item = { rich_text: subRichText };
+              } else {
+                subBlock.numbered_list_item = { rich_text: subRichText };
+              }
+              subChildren.push(subBlock);
+              i++;
+            } else {
+              // subMarker.indent > childIndent - 更深的嵌套，暂不支持多级
+              break;
+            }
+          }
+          if (subChildren.length > 0) {
+            // 将连续的同级子项作为第一个子项的 children
+            // 简化处理：每个子项可能有自己的嵌套
+            // 实际上 Notion 的列表嵌套是一层，这里只处理一层 children
+            children.push(...subChildren);
+          }
+        } else {
+          break;
+        }
+      }
+
+      // Notion API: children 直接放在 block 内
+      if (children.length > 0) {
+        block[blockType === 'to_do' ? 'to_do' : blockType === 'bulleted_list_item' ? 'bulleted_list_item' : 'numbered_list_item'].children = children;
+      }
+
+      groupBlocks.push(block);
+    }
+
+    return { blocks: groupBlocks, consumed: i - startIdx };
+  }
+
   while (i < lines.length) {
     const line = lines[i];
 
@@ -164,7 +279,19 @@ function mdToNotionBlocks(md) {
       continue;
     }
 
-    // 表格（必须在代码块之前检测，因为表格行可能包含特殊字符）
+    // 图片: ![alt](url)
+    const imgMatch = line.match(/^!\[(.*?)\]\((https?:\/\/[^)]+)\)/);
+    if (imgMatch) {
+      blocks.push({
+        object: 'block',
+        type: 'image',
+        image: { type: 'external', external: { url: imgMatch[2] } },
+      });
+      i++;
+      continue;
+    }
+
+    // 表格（必须在代码块之前检测）
     if (line.trim().startsWith('|') && i + 1 < lines.length) {
       const result = parseTable(lines, i);
       if (result.blocks.length > 0) {
@@ -240,43 +367,16 @@ function mdToNotionBlocks(md) {
       i++; continue;
     }
 
-    // 无序列表
-    const ulMatch = line.match(/^- (.+)$/);
-    if (ulMatch) {
-      const listItems = [];
-      while (i < lines.length && lines[i].match(/^- (.+)$/)) {
-        const itemText = lines[i].match(/^- (.+)$/)[1];
-        const formatted = parseInlineFormatting(itemText);
-        if (formatted.length > 0 && formatted[0].paragraph) {
-          listItems.push({ object: 'block', type: 'bulleted_list_item', bulleted_list_item: { rich_text: formatted[0].paragraph.rich_text } });
-        } else {
-          listItems.push({ object: 'block', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ type: 'text', text: { content: itemText } }] } });
-        }
-        i++;
-      }
-      blocks.push(...listItems);
+    // 列表项（包括任务清单）- 使用 parseListGroup 处理嵌套
+    const listMarker = parseListMarker(line);
+    if (listMarker) {
+      const result = parseListGroup(lines, i);
+      blocks.push(...result.blocks);
+      i += result.consumed;
       continue;
     }
 
-    // 有序列表
-    const olMatch = line.match(/^\d+\. (.+)$/);
-    if (olMatch) {
-      const listItems = [];
-      while (i < lines.length && lines[i].match(/^\d+\. (.+)$/)) {
-        const itemText = lines[i].match(/^\d+\. (.+)$/)[1];
-        const formatted = parseInlineFormatting(itemText);
-        if (formatted.length > 0 && formatted[0].paragraph) {
-          listItems.push({ object: 'block', type: 'numbered_list_item', numbered_list_item: { rich_text: formatted[0].paragraph.rich_text } });
-        } else {
-          listItems.push({ object: 'block', type: 'numbered_list_item', numbered_list_item: { rich_text: [{ type: 'text', text: { content: itemText } }] } });
-        }
-        i++;
-      }
-      blocks.push(...listItems);
-      continue;
-    }
-
-    // 普通段落
+    // 普通段落（支持链接）
     const paragraphBlocks = parseInlineFormatting(line);
     if (paragraphBlocks.length > 0) {
       blocks.push(...paragraphBlocks);
@@ -290,9 +390,9 @@ function mdToNotionBlocks(md) {
 }
 
 /**
- * 解析单行内联格式（改进版：使用 matchAll 精确定位，避免 split 边界问题）
+ * 解析内联格式（支持加粗、斜体、删除线、代码、链接）
  */
-function parseInlineFormatting(text) {
+function parseInlineFormatting(text, allowLinks = true) {
   if (!text.trim()) return [];
 
   // 通用的 rich_text 构造器
@@ -305,7 +405,7 @@ function parseInlineFormatting(text) {
       if (m.index > lastIndex) {
         richTexts.push({ type: 'text', text: { content: text.slice(lastIndex, m.index) } });
       }
-      richTexts.push({ type: 'text', text: { content: m[1] }, annotations: getAnnotations(m[1]) });
+      richTexts.push(m[2] ?    { type: 'text', text: { content: m[1], link: { url: m[2] } }, annotations: getAnnotations(m) } :    { type: 'text', text: { content: m[1] }, annotations: getAnnotations(m) });
       lastIndex = m.index + m[0].length;
     }
     if (lastIndex < text.length) {
@@ -334,6 +434,12 @@ function parseInlineFormatting(text) {
   rich = buildRichTexts(/\*(.+?)\*/g, () => ({ italic: true }));
   if (rich) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: rich } }];
 
+  // link: [text](url) - only if allowLinks is true
+  if (allowLinks) {
+    rich = buildRichTexts(/\[(.+?)\]\((https?:\/\/[^)]+)\)/g, () => ({}));
+    if (rich) return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: rich } }];
+  }
+
   if (text.trim()) {
     return [{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content: text } }] } }];
   }
@@ -359,9 +465,17 @@ function formatBlock(block) {
     case 'quote': return `> ${getText(block.quote?.rich_text)}`;
     case 'code': return `\`\`\`${block.code?.language || ''}\n${getText(block.code?.rich_text)}\n\`\`\``;
     case 'divider': return '---';
+    case 'to_do': return `[${block.to_do?.checked ? 'x' : ' '}] ${getText(block.to_do?.rich_text)}`;
     case 'image':
       const imgUrl = block.image?.external?.url || block.image?.file?.url || '';
       return `![image](${imgUrl})`;
+    case 'table': {
+      if (!block.table?.children?.length) return '[table]';
+      return block.table.children.map(row => {
+        const cells = row.table_row?.cells || [];
+        return '| ' + cells.map(cell => getText(cell) || '').join(' | ') + ' |';
+      }).join('\n');
+    }
     default: return `[${block.type}]`;
   }
 }
@@ -594,7 +708,7 @@ async function cmdAppend(args) {
   if (!content.trim()) throw new Error('缺少内容: --md 或 --md-file');
 
   const blocks = mdToNotionBlocks(content);
-  const BATCH_SIZE = 100;
+const BATCH_SIZE = 100;
   for (let i = 0; i < blocks.length; i += BATCH_SIZE) {
     const batch = blocks.slice(i, i + BATCH_SIZE);
     await notionRequest('PATCH', `/blocks/${page}/children`, { children: batch });
